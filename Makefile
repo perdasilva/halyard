@@ -111,8 +111,12 @@ export GO_BUILD_LDFLAGS := -s -w \
     -X '$(VERSION_PATH).version=$(VERSION)'
 
 .PHONY: build
-build: #HELP build h5d binary
+build: clean #HELP build h5d binary
 	go build $(GO_BUILD_FLAGS) -tags '$(GO_BUILD_TAGS)' -ldflags '$(GO_BUILD_LDFLAGS)' -gcflags '$(GO_BUILD_GCFLAGS)' -asmflags '$(GO_BUILD_ASMFLAGS)' -o bin/h5d main.go
+
+.PHONY: clean
+clean: #HELP remove generated artifacts (e.g. bin/, dist/, coverage/, etc.)
+	rm -rf bin dist coverage
 
 #SECTION Release
 ifeq ($(origin ENABLE_RELEASE_PIPELINE), undefined)
@@ -126,5 +130,5 @@ export ENABLE_RELEASE_PIPELINE
 export GORELEASER_ARGS
 
 .PHONY: release
-release: $(GORELEASER) #EXHELP Runs goreleaser for the operator-controller. By default, this will run only as a snapshot and will not publish any artifacts unless it is run with different arguments. To override the arguments, run with "GORELEASER_ARGS=...". When run as a github action from a tag, this target will publish a full release.
+release: $(GORELEASER) #EXHELP Runs goreleaser for halyard. By default, this will run only as a snapshot and will not publish any artifacts unless it is run with different arguments. To override the arguments, run with "GORELEASER_ARGS=...". When run as a github action from a tag, this target will publish a full release.
 	$(GORELEASER) $(GORELEASER_ARGS)
