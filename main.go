@@ -3,10 +3,15 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
-	"github.com/tmc/langchaingo/llms"
+	"github.com/tmc/langchaingo/agents"
+	"github.com/tmc/langchaingo/chains"
 	"github.com/tmc/langchaingo/llms/openai"
+	"github.com/tmc/langchaingo/tools"
+	"halyard/internal/cache"
+	"halyard/internal/tools/clustercatalog"
+	"halyard/internal/tools/clusterextension"
+	"halyard/internal/tools/k8s"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/tools/clientcmd"
 	"log"
@@ -29,30 +34,33 @@ import (
 //	}
 //}
 
-const systemPrompt = `You are Halyard, a Kubernetes assistant specialized in managing OLM v1 resources: ClusterExtension and ClusterCatalog. 
-You help the user explore, configure, and manage these resources in the cluster. Using a set of tools provided to you, you can:
+const promptPrefix = `You are Halyard, a helpful Kubernetes CLI assistant specialized in managing OLM v1 resources: ClusterExtension and ClusterCatalog. You have access to the following tools:
 
-    List and retrieve details of ClusterExtensions and ClusterCatalogs.
-    Cache content from a ClusterCatalog to make it searchable.
-    Search for packages within a ClusterCatalog.
-    Assist in installing, updating, and deleting ClusterExtensions and ClusterCatalogs.
-	Execute generated kubectl commands.
+{{.tool_descriptions}}`
 
-In each interaction, use these capabilities to efficiently address the user's requests. 
-Always confirm actions that could change the state of resources (like installing, updating, or deleting) to avoid unintended modifications. 
-When listing, retrieving, or searching resources, ensure the results are clear and relevant to the user's query.
+const promptFormat = `From now on strictly use the following format:
 
-If you don't know what to do, or if prompted for help, print out a helpful message introducing yourself and your capabilities.
-Format your answers for the command-line terminal making use of ANSI colors and ASCII art to add flourish.`
+Question: the input question you must answer
+Thought: you should always think about what to do
+Action: the action to take, should be one of [ {{.tool_names}} ]
+Action Input: the input to the action
+Observation: the result of the action
+... (this Thought/Action/Action Input/Observation can repeat N times)
+Thought: I now know the final answer
+Final Answer: a succinct final answer to the original input question, which is fit for a CLI application, does not use markdown format, and relies on ANSI colors for styling and emoticons to provide a nice user experience.`
+
+const promptSuffix = `Begin!
+
+Question: {{.input}}
+Thought:{{.agent_scratchpad}}`
 
 func main() {
-
 	kubeconfig := os.Getenv("KUBECONFIG")
 	if kubeconfig == "" {
 		home, _ := os.UserHomeDir()
 		kubeconfig = path.Join(home, ".kube", "config")
 	}
-	if stat, err := os.Stat(kubeconfig); err != nil || !stat.IsDir() {
+	if stat, err := os.Stat(kubeconfig); err != nil || stat.IsDir() {
 		log.Fatalf("kubeconfig file %s does not exist", kubeconfig)
 	}
 
@@ -68,18 +76,36 @@ func main() {
 
 	// Initialize Ollama LLM with Langchaingo
 	// llm, err := ollama.New(ollama.WithModel("llama3.2"))
-	llm, err := openai.New()
+	llm, err := openai.New(openai.WithModel("gpt-4o"))
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	packageCache := cache.NewPackageCache()
+
 	// Sending initial message to the model, with a list of available tools.
-	ctx := context.Background()
-	var messageHistory = []llms.MessageContent{
-		llms.TextParts(llms.ChatMessageTypeSystem, systemPrompt),
+	agentTools := []tools.Tool{
+		clusterextension.NewListTool(dynClient),
+		clusterextension.NewGetTool(dynClient),
+		clusterextension.NewGenerateTool(llm),
+		clustercatalog.NewListTool(dynClient),
+		clustercatalog.NewGetTool(dynClient),
+		clustercatalog.NewCacheTool(config, packageCache),
+		clustercatalog.NewSearchCatalogTool(packageCache),
+		k8s.NewKubectlTool(),
 	}
 
-	fmt.Println("Welcome to the Langchaingo Ollama chatbot! Type 'exit' to quit.")
+	agent := agents.NewOneShotAgent(llm,
+		agentTools,
+		agents.WithMaxIterations(3),
+		agents.WithPromptFormatInstructions(promptFormat),
+		agents.WithPromptPrefix(promptPrefix),
+		agents.WithPromptSuffix(promptSuffix),
+		// agents.NewOpenAIOption().WithSystemMessage(systemPrompt)
+	)
+	executor := agents.NewExecutor(agent)
+
+	fmt.Println("Welcome to the Halyard, the OLM v1 chatbot! Type 'exit' to quit.")
 	reader := bufio.NewReader(os.Stdin)
 	for {
 		// Get user input
@@ -98,101 +124,10 @@ func main() {
 			break
 		}
 
-		messageHistory = append(messageHistory, llms.TextParts(llms.ChatMessageTypeHuman, userInput))
-
-		resp, err := llm.GenerateContent(ctx, messageHistory, llms.WithTools(availableTools))
+		answer, err := chains.Run(context.Background(), executor, userInput)
 		if err != nil {
-			log.Fatal(err)
+			answer = fmt.Sprintf("⚠️ there was an error executing your command, please try again: %v", err)
 		}
-		messageHistory = updateMessageHistory(messageHistory, resp)
-
-		// Execute tool calls requested by the model
-		messageHistory = executeToolCalls(ctx, llm, messageHistory, resp)
-		messageHistory = append(messageHistory, llms.TextParts(llms.ChatMessageTypeHuman, "Generate final response"))
-
-		// Send query to the model again, this time with a history containing its
-		// request to invoke a tool and our response to the tool call.
-		resp, err = llm.GenerateContent(ctx, messageHistory, llms.WithTools(availableTools))
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		fmt.Printf("Bot: %s\n", resp.Choices[0].Content)
+		fmt.Printf("Halyard: %s\n", strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(answer, `\033`, "\033"), `\n`, "\n")))
 	}
-}
-
-// updateMessageHistory updates the message history with the assistant's
-// response and requested tool calls.
-func updateMessageHistory(messageHistory []llms.MessageContent, resp *llms.ContentResponse) []llms.MessageContent {
-	respchoice := resp.Choices[0]
-
-	assistantResponse := llms.TextParts(llms.ChatMessageTypeAI, respchoice.Content)
-	for _, tc := range respchoice.ToolCalls {
-		assistantResponse.Parts = append(assistantResponse.Parts, tc)
-	}
-	return append(messageHistory, assistantResponse)
-}
-
-// executeToolCalls executes the tool calls in the response and returns the
-// updated message history.
-func executeToolCalls(ctx context.Context, llm llms.Model, messageHistory []llms.MessageContent, resp *llms.ContentResponse) []llms.MessageContent {
-	// fmt.Println("Executing", len(resp.Choices[0].ToolCalls), "tool calls")
-	for _, toolCall := range resp.Choices[0].ToolCalls {
-		switch toolCall.FunctionCall.Name {
-		case "listClusterExtensions":
-			response, err := listClusterExtensions()
-			if err != nil {
-				log.Fatal(err)
-			}
-
-			toolResponse := llms.MessageContent{
-				Role: llms.ChatMessageTypeTool,
-				Parts: []llms.ContentPart{
-					llms.ToolCallResponse{
-						ToolCallID: toolCall.ID,
-						Name:       toolCall.FunctionCall.Name,
-						Content:    response,
-					},
-				},
-			}
-			messageHistory = append(messageHistory, toolResponse)
-		default:
-			log.Fatalf("Unsupported tool: %s", toolCall.FunctionCall.Name)
-		}
-	}
-
-	return messageHistory
-}
-
-func listClusterExtensions() (string, error) {
-	response := map[string]interface{}{
-		"list": []string{"argocd-operator", "prometheus-operator"},
-	}
-
-	b, err := json.Marshal(response)
-	if err != nil {
-		return "", err
-	}
-
-	return string(b), nil
-}
-
-// availableTools simulates the tools/functions we're making available for
-// the model.
-var availableTools = []llms.Tool{
-	{
-		Type: "function",
-		Function: &llms.FunctionDefinition{
-			Name:        "listClusterExtensions",
-			Description: "List ClusterExtensions",
-		},
-	},
-}
-
-func showResponse(resp *llms.ContentResponse) string {
-	b, err := json.MarshalIndent(resp, "", "  ")
-	if err != nil {
-		log.Fatal(err)
-	}
-	return string(b)
 }
