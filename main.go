@@ -75,7 +75,7 @@ func main() {
 	}
 
 	// Initialize Ollama LLM with Langchaingo
-	// llm, err := ollama.New(ollama.WithModel("llama3.2"))
+	// llm, err := ollama.New(ollama.WithModel("llama3.1"))
 	llm, err := openai.New(openai.WithModel("gpt-4o"))
 	if err != nil {
 		log.Fatal(err)
