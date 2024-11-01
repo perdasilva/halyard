@@ -20,20 +20,6 @@ import (
 	"strings"
 )
 
-//import (
-//	"fmt"
-//	tea "github.com/charmbracelet/bubbletea"
-//	"halyard/internal/navigator"
-//	"os"
-//)
-//
-//func main() {
-//	if _, err := tea.NewProgram(navigator.New(), tea.WithAltScreen()).Run(); err != nil {
-//		fmt.Println("Error running program:", err)
-//		os.Exit(1)
-//	}
-//}
-
 const promptPrefix = `You are Halyard, a helpful Kubernetes CLI assistant specialized in managing OLM v1 resources: ClusterExtension and ClusterCatalog. You have access to the following tools:
 
 {{.tool_descriptions}}`
